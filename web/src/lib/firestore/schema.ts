@@ -72,6 +72,43 @@ export const Row = z.object({
   thesis: z.string().nullable(),
   notes: z.string().nullable(),
 
+  // X/Twitter signal derived from grok_x_lookup. voice_summary is Grok's
+  // 2-3 sentence read on how this investor thinks/values, inferred from
+  // recent posts. recent_posts is the raw list Grok pulled (newest first).
+  x_voice_summary: z.string().nullable().default(null),
+  x_recent_posts: z
+    .array(
+      z.object({
+        date: z.string(),
+        text: z.string(),
+      }),
+    )
+    .default([]),
+
+  // People associated with the firm (managing partners, GPs, principals, ...).
+  // Populated by the extractor from team/about pages. Empty for person-type rows
+  // (angel / solo_gp / scout_fund / contact), where person_first/last apply instead.
+  partners: z
+    .array(
+      z.object({
+        name: z.string(),
+        title: z.string().nullable().optional(),
+      }),
+    )
+    .default([]),
+
+  // Portfolio companies harvested from /portfolio, /companies, /investments pages.
+  // `fund` groups them (Fund I / Fund II / "Seed" / "Growth" / null if ungrouped).
+  portfolio_companies: z
+    .array(
+      z.object({
+        name: z.string(),
+        url: z.string().nullable().optional(),
+        fund: z.string().nullable().optional(),
+      }),
+    )
+    .default([]),
+
   // Meta
   linked_firm_id: z.number().nullable(),
   completeness_score: z.number().default(0),
@@ -82,6 +119,19 @@ export const Row = z.object({
   last_enriched_at: z.string().nullable().default(null),
   total_steps: z.number().default(0),
   tool_budget_cents_used: z.number().default(0),
+  // Row-level classifier derived from step history. Refreshed after every
+  // step by step-runner. "complete": no missing_fields. "partial": some
+  // fields filled, more to go. "dead_site": at least 2 steps ran and zero
+  // fields were ever extractable (usually JS-rendered/blocked sites).
+  // "error_only": every step errored. null: untouched.
+  scrape_status: z
+    .enum(["complete", "partial", "dead_site", "error_only"])
+    .nullable()
+    .default(null),
+  // Short 1–3 word label that accompanies scrape_status in the UI — used to
+  // surface the specific root cause for error/dead-site rows (e.g. "DNS error",
+  // "proxy error", "empty pages") without forcing the user to open step logs.
+  scrape_status_reason: z.string().nullable().default(null),
 });
 export type Row = z.infer<typeof Row>;
 
@@ -113,6 +163,12 @@ export const Step = z.object({
   // Extraction delta
   extracted_fields: z.record(z.string(), z.unknown()).default({}),
   confidence: z.record(z.string(), z.number()).default({}),
+
+  // Per-field reason a proposed extraction was NOT merged into the row.
+  // Written by finishStepAndMergeRow. Values include: "confidence_floor",
+  // "null_value", "unsourced_overwrite", "anti_truncation",
+  // "partners_title_only_upgrade", "budget".
+  merge_skip_reasons: z.record(z.string(), z.string()).default({}),
 
   error_message: z.string().nullable().default(null),
 });
