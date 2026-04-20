@@ -31,6 +31,14 @@
         { "fieldPath": "sectors_l1", "arrayConfig": "CONTAINS" },
         { "fieldPath": "completeness_score", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "steps",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        { "fieldPath": "project_id", "order": "ASCENDING" },
+        { "fieldPath": "started_at", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

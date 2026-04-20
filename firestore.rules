@@ -20,5 +20,14 @@ service cloud.firestore {
         }
       }
     }
+
+    // Required for collectionGroup('steps') queries (e.g. the dashboard
+    // live log). Nested match rules above only grant access via the
+    // scoped parent path; group queries bypass that scoping and need an
+    // explicit wildcard rule here.
+    match /{path=**}/steps/{stepId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
   }
 }
