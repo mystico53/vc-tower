@@ -43,3 +43,6 @@ next-env.d.ts
 
 # playwright mcp session artifacts
 .playwright-mcp/
+
+# harness-batch diagnosis runs (contain full tool_raw_output payloads)
+.harness/

@@ -170,7 +170,8 @@ function BrandIcon({
   className?: string;
   size?: number;
 }) {
-  const src = `https://img.icons8.com/ios-glyphs/30/${kind}.png`;
+  const slug = kind === "x" ? "twitterx" : "linkedin";
+  const src = `https://img.icons8.com/ios-glyphs/30/${slug}.png`;
   return (
     <img
       src={src}

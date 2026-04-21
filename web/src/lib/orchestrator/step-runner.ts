@@ -8,12 +8,14 @@ import {
   failStep,
   finishStepAndMergeRow,
   writeStopStep,
+  type StepTimings,
 } from "@/lib/firestore/step-writer";
 import { getSystemState, pauseSystem } from "@/lib/firestore/system-pause";
 import { scrapeWebsite } from "@/lib/tools/firecrawl";
 import { parseHits, searchWeb } from "@/lib/tools/firecrawl-search";
 import { scrapeLinkedInCompany, scrapeLinkedInProfile } from "@/lib/tools/apify-linkedin";
 import { grokXLookup } from "@/lib/tools/grok-x-search";
+import { lookupOnVcsheet } from "@/lib/tools/vcsheet";
 import { PAUSE_ON_KINDS, type ToolResult } from "@/lib/tools/types";
 import { extract, type ExtractedDelta } from "./extract";
 import { decide } from "./decide";
@@ -42,6 +44,7 @@ export type StepOutcome = {
   skip_reasons: Record<string, string>;
   row_before: Row;
   row_after: Row;
+  timings: StepTimings;
 };
 
 // Thrown by runOneStep when pre-checks fail — lets callers map to HTTP 409.
@@ -193,6 +196,11 @@ export async function dispatchTool(
         handle: typeof args.handle === "string" ? args.handle : undefined,
       });
     }
+    case "vcsheet_lookup": {
+      const firmName = typeof args.firm_name === "string" ? args.firm_name : "";
+      if (!firmName) return { ok: false, cost_cents: 0, raw: null, error: "missing firm_name" };
+      return lookupOnVcsheet(firmName);
+    }
     default:
       return { ok: false, cost_cents: 0, raw: null, error: `unknown tool: ${tool}` };
   }
@@ -226,6 +234,10 @@ async function finalizeRow(
   const { status, reason } = computeScrapeStatus({
     missing: row.missing_fields ?? [],
     steps: classified,
+    total_steps: row.total_steps ?? 0,
+    step_cap: env.STEP_MAX_PER_ROW,
+    zero_progress_streak: row.zero_progress_streak ?? 0,
+    dead_letter_streak: env.DEAD_LETTER_STREAK,
   });
   const statusChanged = status !== (row.scrape_status ?? null);
   const reasonChanged = reason !== (row.scrape_status_reason ?? null);
@@ -248,6 +260,20 @@ export async function runOneStep(
   projectId: string,
   rowId: string,
 ): Promise<StepOutcome> {
+  const t0 = Date.now();
+  let decide_ms: number | undefined;
+  let tool_ms: number | undefined;
+  let extract_ms: number | undefined;
+  // Firestore admin rejects `undefined`, so only emit keys for phases that ran.
+  // Missing keys round-trip through zod's per-field `.default(null)` on reads.
+  const buildTimings = (): StepTimings => {
+    const t: StepTimings = { total_ms: Date.now() - t0 };
+    if (decide_ms !== undefined) t.decide_ms = decide_ms;
+    if (tool_ms !== undefined) t.tool_ms = tool_ms;
+    if (extract_ms !== undefined) t.extract_ms = extract_ms;
+    return t;
+  };
+
   // Global kill switch — first thing we check so a paused project can't waste
   // budget even on prior-step self-heal or firestore reads beyond the flag.
   const sys = await getSystemState(db, projectId);
@@ -388,6 +414,7 @@ export async function runOneStep(
   // pause — if the orchestrator model itself is out of credits, no row on the
   // project can make progress, so stop everyone.
   let decision;
+  const tDecide = Date.now();
   try {
     decision = await decide({
       row,
@@ -397,7 +424,9 @@ export async function runOneStep(
       deadHosts: [...deadHosts],
       budgetCentsRemaining: budgetRemaining,
     });
+    decide_ms = Date.now() - tDecide;
   } catch (e) {
+    decide_ms = Date.now() - tDecide;
     if (e instanceof LLMUpstreamError) {
       await pauseSystem(db, projectId, {
         reason: e.message.slice(0, 200),
@@ -422,13 +451,15 @@ export async function runOneStep(
 
   // Stop path.
   if (decision.next_action === "stop") {
+    const stopTimings = buildTimings();
     const stop = await writeStopStep(
       db,
       projectId,
       rowId,
-      env.DASHSCOPE_MODEL,
+      env.DECIDE_MODEL,
       decision.reasoning,
       decision.stop_reason ?? "no_useful_tools",
+      stopTimings,
     );
     const rowAfter = await finalizeRow(db, projectId, rowId);
     return {
@@ -443,12 +474,13 @@ export async function runOneStep(
       skip_reasons: {},
       row_before: row,
       row_after: rowAfter,
+      timings: stopTimings,
     };
   }
 
   // Tool path.
   const created = await createRunningStep(db, projectId, rowId, {
-    decisionModel: env.DASHSCOPE_MODEL,
+    decisionModel: env.DECIDE_MODEL,
     decisionReasoning: decision.reasoning,
     chosenTool: decision.tool,
     chosenToolArgs: decision.tool_args,
@@ -456,7 +488,9 @@ export async function runOneStep(
 
   const toolName = decision.tool!;
   try {
+    const tTool = Date.now();
     const toolResult = await dispatchTool(toolName, decision.tool_args, deadHosts, allowedHosts);
+    tool_ms = Date.now() - tTool;
     if (!toolResult.ok) {
       await failStep(db, projectId, rowId, created.stepId, toolResult.error ?? "tool failed with no message", {
         errorKind: toolResult.error_kind ?? null,
@@ -466,6 +500,7 @@ export async function runOneStep(
         // the request is over, and debugging a dead-host trail without it
         // means re-running the scrape.
         toolRawOutput: toolResult.raw,
+        timings: buildTimings(),
       });
       // Credit/auth failures from a paid upstream mean every other in-flight
       // row is about to fail the same way. Flip the global pause before
@@ -490,6 +525,7 @@ export async function runOneStep(
         skip_reasons: {},
         row_before: row,
         row_after: rowAfter,
+        timings: buildTimings(),
       };
     }
 
@@ -499,6 +535,7 @@ export async function runOneStep(
     // noise. The discovered URLs are surfaced to the next step's decide() via
     // the stepsTaken.discovered_links path instead.
     const shouldExtract = toolName !== "web_search";
+    const tExtract = Date.now();
     try {
       if (shouldExtract) {
         extracted = await extract({
@@ -508,9 +545,11 @@ export async function runOneStep(
           row,
         });
       }
+      extract_ms = Date.now() - tExtract;
     } catch (e) {
+      extract_ms = Date.now() - tExtract;
       const msg = `extract failed: ${(e as Error).message}`;
-      await failStep(db, projectId, rowId, created.stepId, msg);
+      await failStep(db, projectId, rowId, created.stepId, msg, { timings: buildTimings() });
       // Same policy as decide(): Dashscope credit/auth/rate_limit trips the
       // pause. Parse / zod errors from extract stay as a per-row error.
       if (e instanceof LLMUpstreamError) {
@@ -533,14 +572,17 @@ export async function runOneStep(
         skip_reasons: {},
         row_before: row,
         row_after: rowAfter,
+        timings: buildTimings(),
       };
     }
 
+    const finishedTimings = buildTimings();
     const finished = await finishStepAndMergeRow(db, projectId, rowId, created.stepId, {
       toolInput: decision.tool_args,
       toolRawOutput: toolResult.raw,
       toolCostCents: toolResult.cost_cents,
       extracted,
+      timings: finishedTimings,
     });
 
     const rowAfter = await finalizeRow(db, projectId, rowId);
@@ -556,6 +598,7 @@ export async function runOneStep(
       skip_reasons: finished.skip_reasons ?? {},
       row_before: row,
       row_after: rowAfter,
+      timings: finishedTimings,
     };
   } catch (e) {
     if (e instanceof BudgetExceededError) {
@@ -563,7 +606,7 @@ export async function runOneStep(
       throw e;
     }
     const msg = `route handler threw: ${(e as Error).message}`;
-    await failStep(db, projectId, rowId, created.stepId, msg);
+    await failStep(db, projectId, rowId, created.stepId, msg, { timings: buildTimings() });
     const rowAfter = await finalizeRow(db, projectId, rowId);
     return {
       stepId: created.stepId,
@@ -577,6 +620,7 @@ export async function runOneStep(
       skip_reasons: {},
       row_before: row,
       row_after: rowAfter,
+      timings: buildTimings(),
     };
   }
 }

@@ -102,6 +102,22 @@ export const ORCHESTRATOR_TOOLS: ToolDef[] = [
   {
     type: "function",
     function: {
+      name: "vcsheet_lookup",
+      description:
+        "Look up the firm on VCSheet (vcsheet.com/fund/<slug>), the public VC directory that exposes investment stages and typical check size as first-class fields. Last-resort source for `stages` and `check_range` when the firm's own website is dead or silent on those two fields. Takes firm_name and derives the slug. Use AT MOST ONCE per row.",
+      parameters: {
+        type: "object",
+        properties: {
+          reasoning: { type: "string" },
+          firm_name: { type: "string" },
+        },
+        required: ["reasoning", "firm_name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "stop",
       description:
         "Stop enrichment for this row. Use when no remaining tool has the inputs it needs, all missing_fields look filled, or budget is exhausted.",

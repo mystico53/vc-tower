@@ -135,13 +135,35 @@ export const Row = z.object({
   last_enriched_at: z.string().nullable().default(null),
   total_steps: z.number().default(0),
   tool_budget_cents_used: z.number().default(0),
+
+  // Dead-letter tracking. Each "batch" is one full play-scrape cycle on a
+  // row (the client loops runOneStep until terminal). batch_attempts is the
+  // cumulative count. zero_progress_streak counts consecutive batches where
+  // no field was merged — resets to 0 on any merge. When it crosses
+  // DEAD_LETTER_STREAK, scrape_status becomes "dead_letter" and the row is
+  // skipped by the candidate pool. last_batch_attempt_at is the ISO timestamp
+  // of the most recent bumpBatchAttempt write.
+  batch_attempts: z.number().default(0),
+  zero_progress_streak: z.number().default(0),
+  last_batch_attempt_at: z.string().nullable().default(null),
   // Row-level classifier derived from step history. Refreshed after every
   // step by step-runner. "complete": no missing_fields. "partial": some
   // fields filled, more to go. "dead_site": at least 2 steps ran and zero
   // fields were ever extractable (usually JS-rendered/blocked sites).
-  // "error_only": every step errored. null: untouched.
+  // "error_only": every step errored. "stuck_at_cap": total_steps hit
+  // STEP_MAX_PER_ROW with missing fields still unfilled — needs operator
+  // intervention (reset, bump cap, or manually mark dead). "dead_letter":
+  // zero_progress_streak >= DEAD_LETTER_STREAK — the candidate pool filters
+  // these out so repeat-empty profiles stop eating credits. null: untouched.
   scrape_status: z
-    .enum(["complete", "partial", "dead_site", "error_only"])
+    .enum([
+      "complete",
+      "partial",
+      "dead_site",
+      "error_only",
+      "stuck_at_cap",
+      "dead_letter",
+    ])
     .nullable()
     .default(null),
   // Short 1–3 word label that accompanies scrape_status in the UI — used to
@@ -163,6 +185,18 @@ export const Step = z.object({
   idx: z.number(),                 // 0, 1, 2, ... per row
   started_at: z.string(),           // ISO
   finished_at: z.string().nullable().default(null),
+  // Phase breakdown in milliseconds. Populated by runOneStep; nulls where the
+  // phase didn't run (e.g. tool_ms/extract_ms null on stop path, extract_ms
+  // null when the tool itself errored).
+  timings: z
+    .object({
+      decide_ms: z.number().nullable().default(null),
+      tool_ms: z.number().nullable().default(null),
+      extract_ms: z.number().nullable().default(null),
+      total_ms: z.number().nullable().default(null),
+    })
+    .partial()
+    .default({}),
   status: StepStatus.default("running"),
 
   // Decision layer

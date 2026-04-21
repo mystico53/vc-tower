@@ -64,7 +64,7 @@ export default function DashboardPage() {
   const combinedError = rowsError ?? stepsError;
 
   return (
-    <main className="flex h-[100dvh] flex-1 flex-col gap-2 p-3">
+    <main className="fixed inset-0 flex flex-col gap-2 overflow-hidden p-3">
       <header className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <h1 className="text-base font-semibold">vc-tower · live scrape</h1>
@@ -98,7 +98,7 @@ export default function DashboardPage() {
             />
           )}
         </section>
-        <aside className="flex w-[20%] min-w-[320px] max-w-[440px] flex-col gap-2">
+        <aside className="flex min-h-0 w-[20%] min-w-[320px] max-w-[440px] flex-col gap-2 overflow-hidden">
           <div className="shrink-0">
             <IndicatorTiles
               rows={rows}
@@ -106,8 +106,8 @@ export default function DashboardPage() {
               completionsLast60s={completionsLast60s}
             />
           </div>
-          <div className="flex-1 overflow-hidden">
-            <LiveLog steps={steps} rows={rows} />
+          <div className="relative min-h-0 flex-1">
+            <LiveLog steps={steps} rows={rows} onSelectRow={setSelectedRow} />
           </div>
         </aside>
       </div>

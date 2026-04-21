@@ -39,7 +39,14 @@ export function computeCompletenessScore(missing: MissingField[]): number {
   return Math.round((100 * filled) / TOTAL_MISSING_BUCKETS);
 }
 
-export type ScrapeStatus = "complete" | "partial" | "dead_site" | "error_only" | null;
+export type ScrapeStatus =
+  | "complete"
+  | "partial"
+  | "dead_site"
+  | "error_only"
+  | "stuck_at_cap"
+  | "dead_letter"
+  | null;
 
 export type ScrapeStatusResult = {
   status: ScrapeStatus;
@@ -51,6 +58,12 @@ export type ScrapeStatusResult = {
 function summarizeError(msg: string | null | undefined): string | null {
   if (!msg) return null;
   const m = msg.toLowerCase();
+  // Classified-content error_kinds (from classifyContent() in tools/): these
+  // are the "200 OK but useless" signals. Check before generic markers so we
+  // surface the specific reason to the UI.
+  if (m.includes("auth_wall")) return "auth wall";
+  if (m.includes("js_required")) return "js required";
+  if (m.includes("empty_content")) return "empty content";
   if (m.includes("err_empty_response")) return "empty response";
   if (m.includes("err_tunnel_connection_failed")) return "proxy error";
   if (m.includes("err_name_not_resolved") || m.includes("getaddrinfo") || m.includes("dns"))
@@ -84,6 +97,15 @@ function summarizeError(msg: string | null | undefined): string | null {
 // fields. Returns status plus a short human-readable reason for the badge
 // tooltip/subtitle so the UI can surface WHY a row is flagged without
 // forcing the user to open the step log.
+//
+// Optional cap / streak counters let this function surface the terminal
+// states that depend on external knowledge:
+//   total_steps + step_cap  → stuck_at_cap (hit the per-row step limit)
+//   zero_progress_streak + dead_letter_streak → dead_letter (N empty batches)
+// Callers that don't supply those still get back the original statuses.
+// dead_letter takes priority over stuck_at_cap — a row that's both stuck and
+// repeatedly empty should be filtered out of the candidate pool, not merely
+// flagged for manual intervention.
 export function computeScrapeStatus(args: {
   missing: MissingField[];
   steps: Array<{
@@ -92,12 +114,42 @@ export function computeScrapeStatus(args: {
     extracted_count: number;
     error_message?: string | null;
   }>;
+  total_steps?: number;
+  step_cap?: number;
+  zero_progress_streak?: number;
+  dead_letter_streak?: number;
 }): ScrapeStatusResult {
   if (args.steps.length === 0) return { status: null, reason: null };
   if (args.missing.length === 0) return { status: "complete", reason: null };
 
   const nonStopSteps = args.steps.filter((s) => s.chosen_tool !== null);
   if (nonStopSteps.length === 0) return { status: "partial", reason: null };
+
+  // Dead-letter: more than DEAD_LETTER_STREAK batches in a row have merged
+  // nothing. Drops the row from the candidate pool until an operator resets
+  // the streak or clears the missing_fields some other way.
+  if (
+    typeof args.zero_progress_streak === "number" &&
+    typeof args.dead_letter_streak === "number" &&
+    args.zero_progress_streak >= args.dead_letter_streak
+  ) {
+    return {
+      status: "dead_letter",
+      reason: `${args.zero_progress_streak} empty batches`,
+    };
+  }
+
+  // Stuck at cap: every step was consumed but fields remain. We check this
+  // after the partial-null-with-only-stops guard so a row that's only ever
+  // seen "stop" steps doesn't falsely claim stuck_at_cap. Only applies when
+  // the caller supplied both counters.
+  if (
+    typeof args.total_steps === "number" &&
+    typeof args.step_cap === "number" &&
+    args.total_steps >= args.step_cap
+  ) {
+    return { status: "stuck_at_cap", reason: "cap reached" };
+  }
 
   const allErrored = nonStopSteps.every((s) => s.status === "error");
   if (allErrored) {
@@ -110,6 +162,17 @@ export function computeScrapeStatus(args: {
   // Dead-site: at least 2 real steps ran, every one extracted nothing.
   const zeroExtracting = nonStopSteps.filter((s) => s.extracted_count === 0);
   if (nonStopSteps.length >= 2 && zeroExtracting.length === nonStopSteps.length) {
+    // If every step reports the same classified content kind (auth_wall /
+    // js_required / empty_content from classifyContent()), surface that as
+    // the dead_site reason instead of the generic "empty pages". Gives the
+    // operator a specific remediation signal — auth_wall needs an account,
+    // js_required needs a JS-rendering tool, empty_content is just dead.
+    const kindTags = nonStopSteps
+      .map((s) => summarizeError(s.error_message))
+      .filter((t): t is string => t === "auth wall" || t === "js required" || t === "empty content");
+    if (kindTags.length === nonStopSteps.length && new Set(kindTags).size === 1) {
+      return { status: "dead_site", reason: kindTags[0] };
+    }
     // Distinguish "sites that errored" vs "sites that returned empty markdown"
     // — the former is transient, the latter is usually JS-rendered.
     const anyErrored = nonStopSteps.some((s) => s.status === "error");

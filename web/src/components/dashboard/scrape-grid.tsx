@@ -7,10 +7,14 @@ type CellState =
   | { kind: "untouched" }
   | { kind: "error" }
   | { kind: "incomplete" }
+  | { kind: "stuck" }          // hit STEP_MAX_PER_ROW with missing_fields still pending
+  | { kind: "dead_letter" }    // empty-batch streak exceeded; skipped by play pool
   | { kind: "progress"; score: number };
 
 function cellStateFor(row: Row): CellState {
+  if (row.scrape_status === "dead_letter") return { kind: "dead_letter" };
   if (row.scrape_status === "error_only") return { kind: "error" };
+  if (row.scrape_status === "stuck_at_cap") return { kind: "stuck" };
   if (row.scrape_status === "dead_site") return { kind: "incomplete" };
   if (row.scrape_status === "complete") return { kind: "progress", score: 100 };
   if ((row.total_steps ?? 0) === 0 && !row.last_enriched_at) {
@@ -20,14 +24,42 @@ function cellStateFor(row: Row): CellState {
   return { kind: "progress", score: Math.max(0, Math.min(100, row.completeness_score ?? 0)) };
 }
 
+function textColorFor(state: CellState): string {
+  switch (state.kind) {
+    case "untouched":
+      return "rgba(0,0,0,0.35)";
+    case "incomplete":
+    case "stuck":
+      return "rgba(0,0,0,0.4)";
+    case "error":
+    case "dead_letter":
+      return "rgba(255,255,255,0.65)";
+    case "progress": {
+      const l = 96 - 76 * (state.score / 100);
+      return l > 55 ? "rgba(0,0,0,0.35)" : "rgba(255,255,255,0.65)";
+    }
+  }
+}
+
 function fillFor(state: CellState): string {
   switch (state.kind) {
     case "untouched":
-      return "#ffffff";
+      return "#e5e7eb";
     case "error":
       return "#dc2626";
     case "incomplete":
       return "#facc15";
+    case "stuck":
+      // amber — deliberately between yellow (incomplete/dead-site) and red
+      // (error_only). "Stuck" is different from "error" because the row has
+      // real progress; different from "incomplete" because there's a
+      // concrete unblock action (reset or bump the cap).
+      return "#f97316";
+    case "dead_letter":
+      // gray — "we're done trying." Visually recedes from the grid so the
+      // operator's eye skips to live rows. The row is skipped by the play
+      // pool so running steps on it requires manual reset.
+      return "#6b7280";
     case "progress": {
       // HSL interp: near-white at 0, dark green at 100.
       // At score=0 we still want a whisper of green to show the row is live.
@@ -98,26 +130,39 @@ export function ScrapeGrid({
   const [geom, setGeom] = useState<Geometry | null>(null);
   const [hover, setHover] = useState<{ index: number; clientX: number; clientY: number } | null>(null);
 
+  // Display order: ascending by numeric id, so cell position is stable and
+  // matches the SQLite row id (1 → top-left, then left-to-right, top-to-bottom).
+  const sortedRows = useMemo(() => {
+    return [...rows].sort((a, b) => {
+      const ai = Number(a.id);
+      const bi = Number(b.id);
+      if (Number.isFinite(ai) && Number.isFinite(bi)) return ai - bi;
+      return a.id.localeCompare(b.id);
+    });
+  }, [rows]);
+
   // Rebuild geometry on container resize.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
     const update = () => {
       const rect = el.getBoundingClientRect();
-      setGeom(computeGeometry({ width: rect.width, height: rect.height }, rows.length));
+      setGeom(computeGeometry({ width: rect.width, height: rect.height }, sortedRows.length));
     };
     update();
     const ro = new ResizeObserver(update);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [rows.length]);
+  }, [sortedRows.length]);
 
   // Keep a ref to current running ids so the RAF loop reads the latest set
   // without re-binding. Same for rows.
   const runningRef = useRef(runningRowIds);
-  const rowsRef = useRef(rows);
+  const rowsRef = useRef(sortedRows);
+  const hoverRef = useRef<number | null>(null);
   useEffect(() => { runningRef.current = runningRowIds; }, [runningRowIds]);
-  useEffect(() => { rowsRef.current = rows; }, [rows]);
+  useEffect(() => { rowsRef.current = sortedRows; }, [sortedRows]);
+  useEffect(() => { hoverRef.current = hover?.index ?? null; }, [hover]);
 
   // Draw loop. Runs at ~20fps so the orange active-cell outline can pulse.
   useEffect(() => {
@@ -150,6 +195,27 @@ export function ScrapeGrid({
         ctx.fillStyle = fillFor(cellStateFor(currentRows[i]));
         ctx.fillRect(x, y, geom.cellW, geom.cellH);
       }
+      // Row id labels, rotated -90° (read bottom-to-top). Only drawn when
+      // the cell is tall/wide enough that the text is legible.
+      const canShowIds = geom.cellW >= 8 && geom.cellH >= 16;
+      if (canShowIds) {
+        ctx.save();
+        ctx.font = "8px ui-monospace, SFMono-Regular, Menlo, monospace";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        for (let i = 0; i < currentRows.length; i++) {
+          const row = currentRows[i];
+          const state = cellStateFor(row);
+          const { x, y } = cellXY(i, geom);
+          ctx.fillStyle = textColorFor(state);
+          ctx.save();
+          ctx.translate(x + geom.cellW / 2, y + geom.cellH - 2);
+          ctx.rotate(-Math.PI / 2);
+          ctx.fillText(row.id, 0, 0);
+          ctx.restore();
+        }
+        ctx.restore();
+      }
       // Pulse stroke for running
       if (running.size > 0) {
         const phase = 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(ts / 200));
@@ -161,6 +227,33 @@ export function ScrapeGrid({
           ctx.strokeRect(x + 0.5, y + 0.5, geom.cellW - 1, geom.cellH - 1);
         }
       }
+      // Hover highlight: inflate the cell and repaint in an accent color so
+      // it visibly "lifts" off the grid. Drawn last so it overlaps neighbors.
+      const hoverIdx = hoverRef.current;
+      if (hoverIdx != null && hoverIdx < currentRows.length) {
+        const row = currentRows[hoverIdx];
+        const { x, y } = cellXY(hoverIdx, geom);
+        const grow = 4;
+        const hx = x - grow;
+        const hy = y - grow;
+        const hw = geom.cellW + grow * 2;
+        const hh = geom.cellH + grow * 2;
+        ctx.fillStyle = "#3b82f6"; // blue-500 accent
+        ctx.fillRect(hx, hy, hw, hh);
+        ctx.strokeStyle = "rgba(15,23,42,0.95)";
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(hx + 0.75, hy + 0.75, hw - 1.5, hh - 1.5);
+        // redraw the id label larger and white on the accent fill
+        ctx.save();
+        ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = "rgba(255,255,255,0.95)";
+        ctx.translate(hx + hw / 2, hy + hh - 3);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillText(row.id, 0, 0);
+        ctx.restore();
+      }
       raf = requestAnimationFrame(draw);
     };
     raf = requestAnimationFrame(draw);
@@ -169,15 +262,17 @@ export function ScrapeGrid({
 
   const hoveredRow = useMemo(() => {
     if (!hover) return null;
-    return rows[hover.index] ?? null;
-  }, [hover, rows]);
+    return sortedRows[hover.index] ?? null;
+  }, [hover, sortedRows]);
 
   const legend = (
     <div className="flex items-center gap-3 text-[11px] text-muted-foreground">
-      <LegendSwatch color="#ffffff" label="untouched" border />
+      <LegendSwatch color="#e5e7eb" label="untouched" border />
       <LegendSwatch color="hsl(140 40% 60%)" label="in progress" />
       <LegendSwatch color="hsl(140 70% 20%)" label="complete" />
       <LegendSwatch color="#facc15" label="incomplete" />
+      <LegendSwatch color="#f97316" label="stuck" />
+      <LegendSwatch color="#6b7280" label="dead letter" />
       <LegendSwatch color="#dc2626" label="error" />
       <span className="ml-2 inline-flex items-center gap-1">
         <span className="h-2.5 w-2.5 rounded-sm border border-orange-500" />
@@ -197,23 +292,23 @@ export function ScrapeGrid({
         </div>
         {legend}
       </div>
-      <div ref={containerRef} className="relative flex-1 overflow-hidden rounded-sm border bg-muted/20">
+      <div ref={containerRef} className="relative flex-1 overflow-hidden rounded-sm border border-muted-foreground/30 bg-muted/20">
         {geom && (
           <canvas
             ref={canvasRef}
             className="block cursor-pointer"
             onMouseMove={(e) => {
               const rect = (e.currentTarget as HTMLCanvasElement).getBoundingClientRect();
-              const idx = indexAt(e.clientX - rect.left, e.clientY - rect.top, geom, rows.length);
+              const idx = indexAt(e.clientX - rect.left, e.clientY - rect.top, geom, sortedRows.length);
               if (idx == null) setHover(null);
               else setHover({ index: idx, clientX: e.clientX, clientY: e.clientY });
             }}
             onMouseLeave={() => setHover(null)}
             onClick={(e) => {
               const rect = (e.currentTarget as HTMLCanvasElement).getBoundingClientRect();
-              const idx = indexAt(e.clientX - rect.left, e.clientY - rect.top, geom, rows.length);
+              const idx = indexAt(e.clientX - rect.left, e.clientY - rect.top, geom, sortedRows.length);
               if (idx == null) return;
-              const row = rows[idx];
+              const row = sortedRows[idx];
               if (row) onSelect(row);
             }}
           />
@@ -243,6 +338,8 @@ function CellTooltip({ row, clientX, clientY }: { row: Row; clientX: number; cli
   const stateLabel =
     state.kind === "untouched" ? "untouched" :
     state.kind === "error" ? "error" :
+    state.kind === "stuck" ? "stuck at cap" :
+    state.kind === "dead_letter" ? "dead letter" :
     state.kind === "incomplete" ? "incomplete" :
     `score ${Math.round(state.score)}`;
   return (

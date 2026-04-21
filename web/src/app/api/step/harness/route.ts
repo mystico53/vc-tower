@@ -29,6 +29,12 @@ type HarnessBody = {
   random?: boolean;
   steps?: number;
   reset?: boolean;
+  // When true the harness keeps running steps after a tool/extract error.
+  // Default false preserves the existing behavior for anyone invoking the
+  // harness to watch a single profile. Set true for diagnosis runs where you
+  // want to see how the orchestrator recovers from mid-run failures instead
+  // of having the whole batch truncate at the first bad step.
+  continue_on_error?: boolean;
 };
 
 type ExtractedReport = {
@@ -78,6 +84,7 @@ function parseBody(raw: unknown): HarnessBody | { error: string } {
   if (typeof b.random === "boolean") out.random = b.random;
   if (typeof b.steps === "number") out.steps = b.steps;
   if (typeof b.reset === "boolean") out.reset = b.reset;
+  if (typeof b.continue_on_error === "boolean") out.continue_on_error = b.continue_on_error;
   if (!out.rowId && !out.filter) {
     return { error: "one of `rowId` or `filter` must be provided" };
   }
@@ -350,8 +357,12 @@ export async function POST(req: Request) {
     });
     finalRow = outcome.row_after;
 
-    // Stop loop on terminal statuses.
-    if (outcome.status === "stopped" || outcome.status === "error") break;
+    // Stop loop on terminal statuses. "stopped" always terminates (the
+    // orchestrator explicitly chose to stop). "error" terminates by default —
+    // callers opt into continue_on_error for diagnosis runs where the point is
+    // to watch how the orchestrator recovers from mid-run failures.
+    if (outcome.status === "stopped") break;
+    if (outcome.status === "error" && !body.continue_on_error) break;
   }
 
   return NextResponse.json({

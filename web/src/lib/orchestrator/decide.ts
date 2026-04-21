@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { env } from "@/lib/env";
 import type { MissingField, Row } from "@/lib/firestore/schema";
+import { decideByRules } from "./decide-rules";
 import { rethrowIfUpstream } from "./llm-error";
 import { DECIDE_SYSTEM_PROMPT } from "./prompts";
 import { enabledTools } from "./tools-catalog";
@@ -48,8 +49,8 @@ export type OrchestratorOutput = {
 
 function buildClient(): OpenAI {
   return new OpenAI({
-    apiKey: env.DASHSCOPE_API_KEY,
-    baseURL: env.DASHSCOPE_BASE_URL,
+    apiKey: env.GEMINI_API_KEY,
+    baseURL: env.GEMINI_BASE_URL,
   });
 }
 
@@ -90,21 +91,57 @@ function buildUserMessage(input: OrchestratorInput): string {
   );
 }
 
-// One-shot tool choice. Qwen must respond with a tool_call; if it returns
-// free text instead we retry once with a stronger nudge.
+// Entry point. First run the deterministic rules — if they return a concrete
+// decision, skip the Dashscope call entirely and return it. Most step-0
+// firecrawls, budget-floor stops, all-filled stops, and dead-site pivots
+// resolve here. When the rules flag a judgment call (e.g. which of 6 candidate
+// subpages to scrape), fall through to Qwen with the rule hint prepended so
+// the LLM only arbitrates the ambiguous piece.
 export async function decide(input: OrchestratorInput): Promise<OrchestratorOutput> {
+  const rule = decideByRules(input);
+  if (rule.decision === "certain") {
+    if (rule.next_action === "stop") {
+      return {
+        reasoning: rule.reasoning,
+        next_action: "stop",
+        tool: null,
+        tool_args: {},
+        stop_reason: rule.stop_reason,
+        raw_response: { source: "rule" },
+      };
+    }
+    return {
+      reasoning: rule.reasoning,
+      next_action: "tool",
+      tool: rule.tool,
+      tool_args: rule.tool_args,
+      stop_reason: null,
+      raw_response: { source: "rule" },
+    };
+  }
+
+  return decideByLLM(input, rule.hint);
+}
+
+// Gemini-backed decide. Same behavior the pre-rules version had, with the rule
+// hint folded into the user message. Kept behind decide() so callers never
+// choose between rule path and LLM path — decide() picks the right one.
+async function decideByLLM(input: OrchestratorInput, ruleHint: string): Promise<OrchestratorOutput> {
   const client = buildClient();
 
   const callOnce = async (extraNudge: string | null) => {
     try {
       const res = await client.chat.completions.create({
-        model: env.DASHSCOPE_MODEL,
+        model: env.DECIDE_MODEL,
         temperature: 0,
         tools: enabledTools(),
-        tool_choice: "required",
+        // Gemini's OpenAI-compat layer documents only "auto"; the retry-with-
+        // nudge below covers the rare case where the model returns no tool call.
+        tool_choice: "auto",
         messages: [
           { role: "system", content: DECIDE_SYSTEM_PROMPT },
           { role: "user", content: buildUserMessage(input) },
+          { role: "user", content: `Rule hint: ${ruleHint}` },
           ...(extraNudge
             ? [{ role: "user" as const, content: extraNudge }]
             : []),
@@ -112,7 +149,7 @@ export async function decide(input: OrchestratorInput): Promise<OrchestratorOutp
       });
       return res;
     } catch (e) {
-      // 401/402/403/429 from Dashscope surface as LLMUpstreamError so
+      // 401/402/403/429 from Gemini surface as LLMUpstreamError so
       // runOneStep can trip the global pause. Plain 400s / parse bugs stay
       // as their original error.
       rethrowIfUpstream("decide", e);
@@ -138,7 +175,11 @@ export async function decide(input: OrchestratorInput): Promise<OrchestratorOutp
     throw new Error(`orchestrator tool args not JSON: ${(e as Error).message}`);
   }
 
-  const reasoning = typeof args.reasoning === "string" ? args.reasoning : "";
+  // Tag LLM-sourced reasoning so downstream tooling can compute the
+  // rule-vs-LLM decision ratio without inferring from raw_response. The
+  // rule-certain path uses a "[rule] ..." prefix from decideByRules.
+  const rawReasoning = typeof args.reasoning === "string" ? args.reasoning : "";
+  const reasoning = `[llm] ${rawReasoning}`;
   const name = toolCall.function.name;
 
   if (name === "stop") {

@@ -41,6 +41,12 @@ function confidenceBar(c: number): string {
   return "bg-zinc-400";
 }
 
+function fmtMs(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms <= 0) return "";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
 function toolPresentation(tool: string | null): {
   Icon: LucideIcon;
   label: string;
@@ -184,6 +190,14 @@ export function StepCard({
           </span>
         </div>
         <div className="flex items-center gap-2">
+          {step.timings?.total_ms != null && step.timings.total_ms > 0 && (
+            <span
+              className="text-xs tabular-nums text-muted-foreground"
+              title={`decide ${fmtMs(step.timings.decide_ms) || "—"} · tool ${fmtMs(step.timings.tool_ms) || "—"} · extract ${fmtMs(step.timings.extract_ms) || "—"}`}
+            >
+              {fmtMs(step.timings.total_ms)}
+            </span>
+          )}
           <span className="text-xs tabular-nums text-muted-foreground">
             {step.tool_cost_cents > 0 ? `${step.tool_cost_cents}¢` : ""}
           </span>
@@ -214,6 +228,21 @@ export function StepCard({
           </button>
         </div>
       </div>
+
+      {step.timings && (step.timings.decide_ms != null || step.timings.tool_ms != null || step.timings.extract_ms != null) && (
+        <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-[10px] tabular-nums text-muted-foreground">
+          <span className="text-foreground/70">{fmtMs(step.timings.total_ms) || "—"} total</span>
+          {step.timings.decide_ms != null && (
+            <span>· decide {fmtMs(step.timings.decide_ms)}</span>
+          )}
+          {step.timings.tool_ms != null && (
+            <span>· tool {fmtMs(step.timings.tool_ms)}</span>
+          )}
+          {step.timings.extract_ms != null && (
+            <span>· extract {fmtMs(step.timings.extract_ms)}</span>
+          )}
+        </div>
+      )}
 
       {step.decision_reasoning && (
         <details className="mt-2 text-xs">

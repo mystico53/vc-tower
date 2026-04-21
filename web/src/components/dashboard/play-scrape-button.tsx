@@ -43,17 +43,50 @@ export function PlayScrapeButton({ rows }: { rows: Row[] }) {
     return (await res.json()) as StepResponse;
   }
 
+  async function bumpBatch(rowId: string, mergedThisRun: boolean, token: string): Promise<void> {
+    // Fire-and-forget: a failed bump is non-fatal (the worst case is a row
+    // that should have entered dead_letter stays as "partial" one batch
+    // longer). We still await so concurrent scrapeRow calls can't race the
+    // Firestore row update with a dashboard re-render.
+    try {
+      await fetch("/api/step/bump-batch", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ rowId, merged_this_run: mergedThisRun }),
+      });
+    } catch {
+      // swallow — dead-letter is a hint, not a correctness guarantee
+    }
+  }
+
   async function scrapeRow(row: Row): Promise<void> {
     if (!user) return;
     const label = row.name ?? row.id;
+    let mergedThisRun = false;
+    const finalize = async () => {
+      if (!user) return;
+      try {
+        const token = await user.getIdToken();
+        await bumpBatch(row.id, mergedThisRun, token);
+      } catch {
+        // no token available — skip
+      }
+    };
     for (let i = 0; i < MAX_STEPS_PER_ROW; i++) {
-      if (!activeRef.current) return;
+      if (!activeRef.current) {
+        await finalize();
+        return;
+      }
       let body: StepResponse;
       try {
         const token = await user.getIdToken();
         body = await stepOnce(row.id, token);
       } catch (e) {
         toast.error(`${label}: ${(e as Error).message}`);
+        await finalize();
         return;
       }
       if ("error" in body && !("status" in body)) {
@@ -66,27 +99,41 @@ export function PlayScrapeButton({ rows }: { rows: Row[] }) {
             `paused · ${body.paused_tool ?? "upstream"} ${body.paused_kind ?? "error"}`,
             { description: body.paused_reason ?? body.error },
           );
+          // Don't bumpBatch on pause — the batch was interrupted, not ended.
           return;
         }
         toast.error(`${label}: ${body.error}`);
+        await finalize();
         return;
       }
       if ("status" in body) {
+        if (body.status !== "error") {
+          // Only done/skipped responses carry a `merged` array (the error
+          // variant doesn't). Narrow before reading it.
+          const merged = body.merged;
+          if (Array.isArray(merged) && merged.length > 0) {
+            mergedThisRun = true;
+          }
+        }
         if (body.status === "error") {
           toast.error(`${label}: ${body.error ?? "error"}`);
+          await finalize();
           return;
         }
         if (body.status === "skipped") {
           toast.warning(`${label}: budget reached`);
+          await finalize();
           return;
         }
         if (body.stop_reason) {
           toast.success(`${label}: done · ${body.stop_reason}`);
+          await finalize();
           return;
         }
       }
     }
     toast.message(`${label}: reached step cap`);
+    await finalize();
   }
 
   async function onPlay() {
@@ -94,6 +141,7 @@ export function PlayScrapeButton({ rows }: { rows: Row[] }) {
     const pool = rows.filter(
       (r) =>
         r.scrape_status !== "complete" &&
+        r.scrape_status !== "dead_letter" &&
         (r.total_steps ?? 0) < DISPLAY_STEP_MAX_PER_ROW,
     );
     if (pool.length === 0) {

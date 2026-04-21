@@ -1,7 +1,26 @@
 import { env } from "@/lib/env";
 import { classifyUpstreamError } from "./classify-error";
+import { classifyContent } from "./classify-content";
 import { scrapeWithJina } from "./jina";
 import type { ToolResult } from "./types";
+
+// A Jina success that returns empty-content / js_required / auth_wall markdown
+// is no better than a firecrawl one — surface the same classified error_kind
+// so decide() reacts the same way. Kept local to firecrawl.ts because Jina is
+// only ever called as a firecrawl fallback.
+function classifyJinaSuccess(fallback: ToolResult): ToolResult {
+  if (!fallback.ok) return fallback;
+  const kind = classifyContent(fallback.markdown);
+  if (!kind) return fallback;
+  return {
+    ok: false,
+    cost_cents: fallback.cost_cents,
+    raw: fallback.raw,
+    error: `jina ${kind}`,
+    raw_source: "jina",
+    error_kind: kind,
+  };
+}
 
 // Firecrawl v2 /scrape: returns LLM-friendly markdown for a single URL.
 // Cost: ~1¢ per successful page (rough).
@@ -31,21 +50,21 @@ export async function scrapeWebsite(url: string): Promise<ToolResult> {
     });
   } catch (e) {
     // Network failure — fall back to Jina.
-    const fallback = await scrapeWithJina(url);
+    const fallback = classifyJinaSuccess(await scrapeWithJina(url));
     return {
       ...fallback,
       error: fallback.ok ? undefined : `firecrawl network error + jina failed: ${(e as Error).message}`,
-      error_kind: fallback.ok ? undefined : "network",
+      error_kind: fallback.ok ? undefined : fallback.error_kind ?? "network",
     };
   }
 
   if (res.status === 429 || res.status >= 500) {
     // Rate limit or transient Firecrawl proxy/tunnel error — fall back to Jina.
-    const fallback = await scrapeWithJina(url);
+    const fallback = classifyJinaSuccess(await scrapeWithJina(url));
     if (!fallback.ok) {
       return {
         ...fallback,
-        error: `firecrawl ${res.status} + jina failed: ${fallback.error ?? "unknown"}`,
+        error: `firecrawl ${res.status} + jina ${fallback.error_kind ?? "failed"}: ${fallback.error ?? "unknown"}`,
       };
     }
     return fallback;
@@ -98,15 +117,15 @@ export async function scrapeWebsite(url: string): Promise<ToolResult> {
     }
     // Other in-body failures (site errors, tunnel issues) — try Jina before
     // giving up, same as with 5xx.
-    const fallback = await scrapeWithJina(url);
+    const fallback = classifyJinaSuccess(await scrapeWithJina(url));
     if (fallback.ok) return fallback;
     return {
       ok: false,
       cost_cents: 0,
       raw: body,
-      error: `firecrawl ${code}: ${errText.slice(0, 200)} + jina failed: ${fallback.error ?? "unknown"}`,
+      error: `firecrawl ${code}: ${errText.slice(0, 200)} + jina ${fallback.error_kind ?? "failed"}: ${fallback.error ?? "unknown"}`,
       raw_source: "firecrawl",
-      error_kind: "other",
+      error_kind: fallback.error_kind ?? "other",
     };
   }
 
@@ -131,6 +150,24 @@ export async function scrapeWebsite(url: string): Promise<ToolResult> {
       error: `firecrawl origin ${originStatus}`,
       raw_source: "firecrawl",
       error_kind: "other",
+    };
+  }
+
+  // Classify "200 OK but useless" cases. A page that Firecrawl fetched
+  // without error but returned near-empty, login-walled, or JS-stub markdown
+  // is either (a) JS-rendered and needs a different tool, (b) paywalled, or
+  // (c) a redirect stub. Surface a specific error_kind so decide() can pivot
+  // tools on the first hit instead of burning the 2-zero-extraction dead-site
+  // cycle before giving up. Firecrawl still billed 1¢, so cost_cents stays.
+  const contentKind = classifyContent(markdown);
+  if (contentKind) {
+    return {
+      ok: false,
+      cost_cents: 1,
+      raw: body,
+      error: `firecrawl ${contentKind}`,
+      raw_source: "firecrawl",
+      error_kind: contentKind,
     };
   }
 

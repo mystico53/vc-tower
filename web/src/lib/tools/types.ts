@@ -18,13 +18,16 @@ export type ToolResult = {
 };
 
 export type ToolErrorKind =
-  | "credit"       // 402, "insufficient credit", quota exhausted
-  | "auth"         // 401, invalid API key
-  | "rate_limit"   // 429
-  | "network"      // fetch threw
-  | "dead_host"    // DNS resolution failed / hostname unreachable — every subpath on this host is doomed
-  | "invented_url" // orchestrator asked to scrape a URL whose host wasn't from row.website / discovered_links / urls_scraped. Short-circuited before we spent a Firecrawl call.
-  | "other";       // 400/404/5xx/empty-result — not fatal to the run
+  | "credit"        // 402, "insufficient credit", quota exhausted
+  | "auth"          // 401, invalid API key
+  | "rate_limit"    // 429
+  | "network"       // fetch threw
+  | "dead_host"     // DNS resolution failed / hostname unreachable — every subpath on this host is doomed
+  | "invented_url"  // orchestrator asked to scrape a URL whose host wasn't from row.website / discovered_links / urls_scraped. Short-circuited before we spent a Firecrawl call.
+  | "empty_content" // 200 OK but markdown has almost no real text — blank page / redirect stub
+  | "js_required"   // 200 OK but page explicitly requires JavaScript to render (noscript message)
+  | "auth_wall"     // 200 OK but page is a login/paywall stub — no content for unauthed scraper
+  | "other";        // 400/404/5xx/unclassified — not fatal to the run
 
 // Which error kinds should trip the global pause. Exported so the orchestrator
 // and any future call site agree on the policy in one place.
@@ -35,4 +38,5 @@ export type ToolName =
   | "web_search"
   | "linkedin_profile"
   | "linkedin_company"
-  | "grok_x_lookup";
+  | "grok_x_lookup"
+  | "vcsheet_lookup";
