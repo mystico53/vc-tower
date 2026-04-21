@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { env } from "@/lib/env";
 import type { MissingField, Row } from "@/lib/firestore/schema";
+import { rethrowIfUpstream } from "./llm-error";
 import { DECIDE_SYSTEM_PROMPT } from "./prompts";
 import { enabledTools } from "./tools-catalog";
 
@@ -14,6 +15,7 @@ export type OrchestratorInput = {
     | "linkedin"
     | "twitter"
     | "email"
+    | "x_voice_summary"
   >;
   missingFields: MissingField[];
   stepsTaken: Array<{
@@ -25,6 +27,10 @@ export type OrchestratorInput = {
     discovered_links?: string[];
   }>;
   urlsScraped: string[];
+  // Hostnames proven unreachable on a prior step (DNS failure or equivalent).
+  // The decider must not pick a firecrawl_website url on one of these hosts —
+  // every subpath will DNS-fail too. Prefer a non-web tool or stop.
+  deadHosts: string[];
   budgetCentsRemaining: number;
 };
 
@@ -44,13 +50,36 @@ function buildClient(): OpenAI {
   });
 }
 
+// A LinkedIn URL in row.website is almost always mis-ingested data (the
+// source sheet slipped the LinkedIn link into the website column). If we
+// leave it in the row payload, the decider either scrapes linkedin.com via
+// firecrawl (returns a login wall) or — worse — invents a plausible-looking
+// real domain and hands it to firecrawl, wasting a step on DNS failure.
+// Passing website: null forces the decider down the linkedin_company /
+// web_search path instead of guessing.
+function sanitizeWebsite(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    if (host === "linkedin.com" || host.endsWith(".linkedin.com")) return null;
+  } catch {
+    return null;
+  }
+  return url;
+}
+
 function buildUserMessage(input: OrchestratorInput): string {
+  const sanitizedRow = {
+    ...input.row,
+    website: sanitizeWebsite(input.row.website),
+  };
   return JSON.stringify(
     {
-      row: input.row,
+      row: sanitizedRow,
       missing_fields: input.missingFields,
       steps_taken: input.stepsTaken,
       urls_scraped: input.urlsScraped,
+      dead_hosts: input.deadHosts,
       budget_cents_remaining: input.budgetCentsRemaining,
     },
     null,
@@ -64,20 +93,27 @@ export async function decide(input: OrchestratorInput): Promise<OrchestratorOutp
   const client = buildClient();
 
   const callOnce = async (extraNudge: string | null) => {
-    const res = await client.chat.completions.create({
-      model: env.DASHSCOPE_MODEL,
-      temperature: 0,
-      tools: enabledTools(),
-      tool_choice: "required",
-      messages: [
-        { role: "system", content: DECIDE_SYSTEM_PROMPT },
-        { role: "user", content: buildUserMessage(input) },
-        ...(extraNudge
-          ? [{ role: "user" as const, content: extraNudge }]
-          : []),
-      ],
-    });
-    return res;
+    try {
+      const res = await client.chat.completions.create({
+        model: env.DASHSCOPE_MODEL,
+        temperature: 0,
+        tools: enabledTools(),
+        tool_choice: "required",
+        messages: [
+          { role: "system", content: DECIDE_SYSTEM_PROMPT },
+          { role: "user", content: buildUserMessage(input) },
+          ...(extraNudge
+            ? [{ role: "user" as const, content: extraNudge }]
+            : []),
+        ],
+      });
+      return res;
+    } catch (e) {
+      // 401/402/403/429 from Dashscope surface as LLMUpstreamError so
+      // runOneStep can trip the global pause. Plain 400s / parse bugs stay
+      // as their original error.
+      rethrowIfUpstream("decide", e);
+    }
   };
 
   let res = await callOnce(null);

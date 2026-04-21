@@ -1,7 +1,18 @@
 "use client";
 
 import { useState } from "react";
-import { CheckIcon, CopyIcon, RotateCcwIcon } from "lucide-react";
+import {
+  Building2Icon,
+  CheckIcon,
+  CopyIcon,
+  FlagIcon,
+  GlobeIcon,
+  MessageCircleIcon,
+  RotateCcwIcon,
+  SearchIcon,
+  UserIcon,
+  type LucideIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 import type { Step, StepStatus } from "@/lib/firestore/schema";
 import { Badge } from "@/components/ui/badge";
@@ -28,6 +39,26 @@ function confidenceBar(c: number): string {
   if (c >= 0.8) return "bg-emerald-500";
   if (c >= 0.5) return "bg-amber-500";
   return "bg-zinc-400";
+}
+
+function toolPresentation(tool: string | null): {
+  Icon: LucideIcon;
+  label: string;
+} {
+  switch (tool) {
+    case "firecrawl_website":
+      return { Icon: GlobeIcon, label: "Web scrape" };
+    case "web_search":
+      return { Icon: SearchIcon, label: "Web search" };
+    case "linkedin_profile":
+      return { Icon: UserIcon, label: "LinkedIn profile" };
+    case "linkedin_company":
+      return { Icon: Building2Icon, label: "LinkedIn company" };
+    case "grok_x_lookup":
+      return { Icon: MessageCircleIcon, label: "X search" };
+    default:
+      return { Icon: FlagIcon, label: "Stop" };
+  }
 }
 
 type FieldDelta = {
@@ -59,12 +90,20 @@ function isRecentPostArray(v: unknown): v is RecentPost[] {
 // generic extracted-fields loop so the list doesn't double up.
 const X_SIGNAL_KEYS = new Set(["x_voice_summary", "x_recent_posts"]);
 
-export function StepCard({ step }: { step: Step }) {
+export function StepCard({
+  step,
+  onRerun,
+}: {
+  step: Step;
+  onRerun?: () => Promise<void> | void;
+}) {
   const s = statusVariant(step.status);
   const extracted = step.extracted_fields as Record<string, unknown>;
   const [copied, setCopied] = useState(false);
   const [redoing, setRedoing] = useState(false);
   const { user } = useAuth();
+  const { Icon: ToolIcon, label: toolLabel } = toolPresentation(step.chosen_tool);
+  const stepNumber = step.idx + 1;
 
   async function copyStep() {
     try {
@@ -79,8 +118,8 @@ export function StepCard({ step }: { step: Step }) {
   async function redoStep() {
     if (!user) return;
     const confirmMsg =
-      `Redo from step #${String(step.idx).padStart(3, "0")}?\n\n` +
-      `This deletes this step and any later steps, refunds their budget, and lets you re-run from here. ` +
+      `Redo from step ${stepNumber}?\n\n` +
+      `This deletes this step and any later steps, refunds their budget, then re-runs from here. ` +
       `Row fields already merged from those steps will NOT be cleared — only the audit log is rewound.`;
     if (!window.confirm(confirmMsg)) return;
     setRedoing(true);
@@ -103,9 +142,16 @@ export function StepCard({ step }: { step: Step }) {
         toast.error(`Redo failed: ${body.error ?? `HTTP ${res.status}`}`);
         return;
       }
-      toast.success(
-        `Rewound to step #${String(step.idx).padStart(3, "0")} — deleted ${body.deleted}, refunded ${body.refunded_cents}¢. Click Step to re-run.`,
-      );
+      if (onRerun) {
+        toast.success(
+          `Rewound to step ${stepNumber} — deleted ${body.deleted}, refunded ${body.refunded_cents}¢. Re-running…`,
+        );
+        await onRerun();
+      } else {
+        toast.success(
+          `Rewound to step ${stepNumber} — deleted ${body.deleted}, refunded ${body.refunded_cents}¢.`,
+        );
+      }
     } catch (e) {
       toast.error(`Redo failed: ${(e as Error).message}`);
     } finally {
@@ -114,14 +160,19 @@ export function StepCard({ step }: { step: Step }) {
   }
 
   return (
-    <div className="rounded-md border bg-card p-3 text-sm ring-1 ring-foreground/5">
+    <div className="min-w-0 rounded-md border bg-card p-3 text-sm ring-1 ring-foreground/5">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <span className="font-mono text-xs text-muted-foreground">
-            #{String(step.idx).padStart(3, "0")}
+          <span className="text-xs font-semibold tabular-nums text-foreground">
+            Step {stepNumber}
           </span>
-          <Badge variant="outline" className="font-mono text-[10px]">
-            {step.chosen_tool ?? "stop"}
+          <Badge
+            variant="outline"
+            className="gap-1 text-[11px]"
+            title={step.chosen_tool ?? "stop"}
+          >
+            <ToolIcon className="size-3" />
+            {toolLabel}
           </Badge>
           <span
             className={cn(
@@ -169,7 +220,7 @@ export function StepCard({ step }: { step: Step }) {
           <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
             reasoning
           </summary>
-          <p className="mt-1 whitespace-pre-wrap text-foreground/80">
+          <p className="mt-1 whitespace-pre-wrap break-words text-foreground/80">
             {step.decision_reasoning}
           </p>
         </details>
@@ -220,7 +271,7 @@ export function StepCard({ step }: { step: Step }) {
                 <span className="w-28 shrink-0 font-mono text-[11px] text-muted-foreground">
                   {field}
                 </span>
-                <div className="flex-1">
+                <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
                     <span
                       className={cn(
@@ -242,7 +293,7 @@ export function StepCard({ step }: { step: Step }) {
                     </span>
                   </div>
                   {v.evidence_quote && (
-                    <div className="mt-0.5 text-[10px] italic text-muted-foreground">
+                    <div className="mt-0.5 break-words text-[10px] italic text-muted-foreground">
                       “{v.evidence_quote}”
                     </div>
                   )}
@@ -256,12 +307,12 @@ export function StepCard({ step }: { step: Step }) {
       <XSignalBlock extracted={extracted} />
 
       {step.error_message && step.status !== "done" && (
-        <div className="mt-2 rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-700 dark:text-red-300">
+        <div className="mt-2 break-words rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-700 dark:text-red-300">
           {step.error_message}
         </div>
       )}
       {step.error_message && step.status === "done" && step.chosen_tool == null && (
-        <div className="mt-2 rounded border border-zinc-500/30 bg-zinc-500/10 p-2 text-xs text-zinc-700 dark:text-zinc-300">
+        <div className="mt-2 break-words rounded border border-zinc-500/30 bg-zinc-500/10 p-2 text-xs text-zinc-700 dark:text-zinc-300">
           stop_reason: {step.error_message}
         </div>
       )}

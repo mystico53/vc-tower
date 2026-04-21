@@ -1,9 +1,13 @@
 import OpenAI from "openai";
 import { z } from "zod";
 import { env } from "@/lib/env";
-import type { MissingField, Row } from "@/lib/firestore/schema";
+import { InvestorType, type MissingField, type Row } from "@/lib/firestore/schema";
 import { isCanonicalSectorL1, isCanonicalStage } from "./canonical";
+import { rethrowIfUpstream } from "./llm-error";
 import { EXTRACT_SYSTEM_PROMPT } from "./prompts";
+
+const INVESTOR_TYPE_SET: Set<string> = new Set(InvestorType.options);
+const NUM_INVESTMENTS_BANDS: Set<string> = new Set(["1-10", "11-50", "51-200", "200+"]);
 
 const FieldDelta = z.object({
   value: z.unknown(),
@@ -18,15 +22,23 @@ export const ExtractedDelta = z
   .object({
     stages: FieldDelta,
     sectors_l1: FieldDelta,
+    sectors_l2: FieldDelta,
+    sectors_raw: FieldDelta,
     thesis: FieldDelta,
     check_min_usd: FieldDelta,
     check_max_usd: FieldDelta,
+    check_raw: FieldDelta,
+    stages_raw: FieldDelta,
+    num_investments_band: FieldDelta,
     hq_country: FieldDelta,
+    hq_address: FieldDelta,
     countries_invest: FieldDelta,
+    investor_type: FieldDelta,
     email: FieldDelta,
     linkedin: FieldDelta,
     website: FieldDelta,
     twitter: FieldDelta,
+    logo_url: FieldDelta,
     partners: FieldDelta,
     portfolio_companies: FieldDelta,
     x_voice_summary: FieldDelta,
@@ -38,15 +50,23 @@ export type ExtractedDelta = z.infer<typeof ExtractedDelta>;
 const EXTRACTABLE_KEYS = [
   "stages",
   "sectors_l1",
+  "sectors_l2",
+  "sectors_raw",
   "thesis",
   "check_min_usd",
   "check_max_usd",
+  "check_raw",
+  "stages_raw",
+  "num_investments_band",
   "hq_country",
+  "hq_address",
   "countries_invest",
+  "investor_type",
   "email",
   "linkedin",
   "website",
   "twitter",
+  "logo_url",
   "partners",
   "portfolio_companies",
   "x_voice_summary",
@@ -164,16 +184,20 @@ async function callExtractor(
   input: ExtractorInput,
   reminder: string | null,
 ): Promise<string> {
-  const res = await client.chat.completions.create({
-    model: env.DASHSCOPE_MODEL,
-    temperature: 0,
-    response_format: { type: "json_object" },
-    messages: [
-      { role: "system", content: EXTRACT_SYSTEM_PROMPT },
-      { role: "user", content: userMessage(input, reminder) },
-    ],
-  });
-  return res.choices[0]?.message.content ?? "";
+  try {
+    const res = await client.chat.completions.create({
+      model: env.DASHSCOPE_MODEL,
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: EXTRACT_SYSTEM_PROMPT },
+        { role: "user", content: userMessage(input, reminder) },
+      ],
+    });
+    return res.choices[0]?.message.content ?? "";
+  } catch (e) {
+    rethrowIfUpstream("extract", e);
+  }
 }
 
 function stripNonCanonical(delta: ExtractedDelta): ExtractedDelta {
@@ -195,29 +219,139 @@ function stripNonCanonical(delta: ExtractedDelta): ExtractedDelta {
     else out.sectors_l1 = { ...out.sectors_l1, value: filtered };
   }
 
+  // sectors_l2: free-form tags preserving the firm's own language. Dedupe
+  // (case-insensitive), trim, drop empties, cap each entry at 80 chars and
+  // the list at 10 entries. We deliberately do NOT map to canonical here —
+  // that's what sectors_l1 is for.
+  if (out.sectors_l2 && Array.isArray(out.sectors_l2.value)) {
+    const seen = new Set<string>();
+    const cleaned = (out.sectors_l2.value as unknown[])
+      .map((x) => (typeof x === "string" ? x.trim() : ""))
+      .filter((x) => x.length > 0)
+      .map((x) => x.slice(0, 80))
+      .filter((x) => {
+        const key = x.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 10);
+    if (cleaned.length === 0) delete out.sectors_l2;
+    else out.sectors_l2 = { ...out.sectors_l2, value: cleaned };
+  }
+
+  // sectors_raw: short comma-joined verbatim phrases; cap at 300 chars.
+  if (out.sectors_raw && typeof out.sectors_raw.value === "string") {
+    const trimmed = out.sectors_raw.value.trim().slice(0, 300);
+    if (trimmed.length === 0) delete out.sectors_raw;
+    else out.sectors_raw = { ...out.sectors_raw, value: trimmed };
+  }
+
+  // check_raw / stages_raw / hq_address: free-form short strings. Trim and
+  // cap at 300 chars to keep Firestore docs small.
+  for (const key of ["check_raw", "stages_raw", "hq_address"] as const) {
+    const f = out[key];
+    if (f && typeof f.value === "string") {
+      const trimmed = f.value.trim().slice(0, 300);
+      if (trimmed.length === 0) delete out[key];
+      else out[key] = { ...f, value: trimmed };
+    }
+  }
+
+  // logo_url: must be an absolute http/https URL. Drop junk inputs (data URIs,
+  // relative paths, empty strings) so the image renderer never chokes.
+  if (out.logo_url) {
+    const v =
+      typeof out.logo_url.value === "string" ? out.logo_url.value.trim() : "";
+    if (!/^https?:\/\//i.test(v) || v.length > 500) {
+      delete out.logo_url;
+    } else {
+      out.logo_url = { ...out.logo_url, value: v };
+    }
+  }
+
+  // num_investments_band: only accept the 4 canonical bands.
+  if (out.num_investments_band && typeof out.num_investments_band.value === "string") {
+    const v = out.num_investments_band.value.trim();
+    if (!NUM_INVESTMENTS_BANDS.has(v)) delete out.num_investments_band;
+    else out.num_investments_band = { ...out.num_investments_band, value: v };
+  }
+
+  // investor_type: must be one of the InvestorType enum values. Never accept
+  // "unknown" from the extractor — that's the default, not an inference.
+  if (out.investor_type && typeof out.investor_type.value === "string") {
+    const v = out.investor_type.value.trim();
+    if (!INVESTOR_TYPE_SET.has(v) || v === "unknown") delete out.investor_type;
+    else out.investor_type = { ...out.investor_type, value: v };
+  } else if (out.investor_type) {
+    delete out.investor_type;
+  }
+
+  if (out.countries_invest && Array.isArray(out.countries_invest.value)) {
+    const filtered = (out.countries_invest.value as unknown[]).flatMap((x) => {
+      if (typeof x === "string") return [x];
+      if (x && typeof x === "object" && "value" in (x as Record<string, unknown>)) {
+        const v = (x as Record<string, unknown>).value;
+        if (typeof v === "string") return [v];
+        if (Array.isArray(v)) return v.filter((s): s is string => typeof s === "string");
+      }
+      return [];
+    });
+    if (filtered.length === 0) delete out.countries_invest;
+    else out.countries_invest = { ...out.countries_invest, value: filtered };
+  }
+
   if (out.partners && Array.isArray(out.partners.value)) {
+    const cleanHttpUrl = (u: unknown): string | null =>
+      typeof u === "string" && /^https?:\/\//i.test(u.trim()) && u.trim().length <= 500
+        ? u.trim()
+        : null;
     const cleaned = (out.partners.value as unknown[])
       .map((p) => {
         if (typeof p !== "object" || p === null) return null;
-        const obj = p as { name?: unknown; title?: unknown };
+        const obj = p as {
+          name?: unknown;
+          title?: unknown;
+          linkedin_url?: unknown;
+          photo_url?: unknown;
+        };
         if (typeof obj.name !== "string" || obj.name.trim().length === 0) return null;
         const title =
           typeof obj.title === "string" && obj.title.trim().length > 0
             ? obj.title.trim()
             : null;
-        return { name: obj.name.trim(), title };
+        return {
+          name: obj.name.trim(),
+          title,
+          linkedin_url: cleanHttpUrl(obj.linkedin_url),
+          photo_url: cleanHttpUrl(obj.photo_url),
+        };
       })
-      .filter((p): p is { name: string; title: string | null } => p !== null);
+      .filter(
+        (
+          p,
+        ): p is {
+          name: string;
+          title: string | null;
+          linkedin_url: string | null;
+          photo_url: string | null;
+        } => p !== null,
+      );
     if (cleaned.length === 0) delete out.partners;
     else out.partners = { ...out.partners, value: cleaned };
   }
 
   if (out.portfolio_companies && Array.isArray(out.portfolio_companies.value)) {
     const seen = new Set<string>();
-    const cleaned = (out.portfolio_companies.value as unknown[])
+    const cleanedArr = (out.portfolio_companies.value as unknown[])
       .map((c) => {
         if (typeof c !== "object" || c === null) return null;
-        const obj = c as { name?: unknown; url?: unknown; fund?: unknown };
+        const obj = c as {
+          name?: unknown;
+          url?: unknown;
+          fund?: unknown;
+          logo_url?: unknown;
+        };
         if (typeof obj.name !== "string" || obj.name.trim().length === 0) return null;
         const url =
           typeof obj.url === "string" && /^https?:\/\//i.test(obj.url.trim())
@@ -227,11 +361,23 @@ function stripNonCanonical(delta: ExtractedDelta): ExtractedDelta {
           typeof obj.fund === "string" && obj.fund.trim().length > 0
             ? obj.fund.trim()
             : null;
-        return { name: obj.name.trim(), url, fund };
+        const logo_url =
+          typeof obj.logo_url === "string" &&
+          /^https?:\/\//i.test(obj.logo_url.trim()) &&
+          obj.logo_url.trim().length <= 500
+            ? obj.logo_url.trim()
+            : null;
+        return { name: obj.name.trim(), url, fund, logo_url };
       })
       .filter(
-        (c): c is { name: string; url: string | null; fund: string | null } =>
-          c !== null,
+        (
+          c,
+        ): c is {
+          name: string;
+          url: string | null;
+          fund: string | null;
+          logo_url: string | null;
+        } => c !== null,
       )
       .filter((c) => {
         const key = `${c.name.toLowerCase()}|${c.fund ?? ""}`;
@@ -239,8 +385,8 @@ function stripNonCanonical(delta: ExtractedDelta): ExtractedDelta {
         seen.add(key);
         return true;
       });
-    if (cleaned.length === 0) delete out.portfolio_companies;
-    else out.portfolio_companies = { ...out.portfolio_companies, value: cleaned };
+    if (cleanedArr.length === 0) delete out.portfolio_companies;
+    else out.portfolio_companies = { ...out.portfolio_companies, value: cleanedArr };
   }
 
   return out;

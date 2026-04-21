@@ -46,6 +46,11 @@ export const Row = z.object({
   website: z.string().nullable(),
   twitter: z.string().nullable(),
 
+  // Firm logo URL — populated by the extractor from LinkedIn company payloads
+  // (logo_url / company_logo) or OG image tags on the firm site. The drawer
+  // prefers this over the Google favicon fallback when present.
+  logo_url: z.string().nullable().default(null),
+
   // Geography
   hq_address: z.string().nullable(),
   hq_country: z.string().nullable(),           // ISO-2
@@ -88,11 +93,21 @@ export const Row = z.object({
   // People associated with the firm (managing partners, GPs, principals, ...).
   // Populated by the extractor from team/about pages. Empty for person-type rows
   // (angel / solo_gp / scout_fund / contact), where person_first/last apply instead.
+  // x_* fields are populated on demand via the drawer's per-partner X lookup
+  // button, NOT by the orchestrator — they're manual enrichment per person.
   partners: z
     .array(
       z.object({
         name: z.string(),
         title: z.string().nullable().optional(),
+        linkedin_url: z.string().nullable().optional(),
+        photo_url: z.string().nullable().optional(),
+        x_handle: z.string().nullable().optional(),
+        x_voice_summary: z.string().nullable().optional(),
+        x_recent_posts: z
+          .array(z.object({ date: z.string(), text: z.string() }))
+          .nullable()
+          .optional(),
       }),
     )
     .default([]),
@@ -105,6 +120,7 @@ export const Row = z.object({
         name: z.string(),
         url: z.string().nullable().optional(),
         fund: z.string().nullable().optional(),
+        logo_url: z.string().nullable().optional(),
       }),
     )
     .default([]),
@@ -171,6 +187,18 @@ export const Step = z.object({
   merge_skip_reasons: z.record(z.string(), z.string()).default({}),
 
   error_message: z.string().nullable().default(null),
+
+  // Classified error kind from the tool layer (ToolErrorKind plus "invented_url").
+  // Lets the UI filter dead_host vs rate_limit vs invented_url without
+  // string-sniffing error_message, and lets the orchestrator surface the kind
+  // to the next decide() call so it pivots tools instead of retrying.
+  error_kind: z.string().nullable().default(null),
+
+  // Free-form structured error context, additive so new kinds don't need
+  // a schema migration. Current shapes:
+  //   dead_host:    { host: string }
+  //   invented_url: { tried_host, allowed_hosts: string[] }
+  error_detail: z.record(z.string(), z.unknown()).nullable().default(null),
 });
 export type Step = z.infer<typeof Step>;
 
@@ -190,6 +218,21 @@ export const paths = {
   steps: (pid: string, rowId: string) => `projects/${pid}/rows/${rowId}/steps`,
   step: (pid: string, rowId: string, stepId: string) =>
     `projects/${pid}/rows/${rowId}/steps/${stepId}`,
+  // Global "paused" flag. Single doc so it's cheap to read from every
+  // runOneStep invocation and cheap to subscribe to from the dashboard.
+  systemState: (pid: string) => `projects/${pid}/system/state`,
 } as const;
+
+// Contents of projects/{pid}/system/state. When paused=true, runOneStep
+// short-circuits with PreCheckError("system_paused") so /api/step returns
+// 409 and the client stops all in-flight scrapes. Operator un-pauses via
+// /api/system/unpause once credits are topped up.
+export type SystemState = {
+  paused: boolean;
+  paused_at: string | null;     // ISO; when the switch flipped
+  paused_reason: string | null; // short human-readable string, e.g. "apify 402: insufficient credit"
+  paused_tool: string | null;   // which tool tripped it
+  paused_kind: string | null;   // error_kind that tripped it: "credit" | "auth"
+};
 
 export const DEFAULT_PROJECT_ID = "default";

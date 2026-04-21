@@ -10,6 +10,8 @@ import { useLiveSteps } from "@/lib/firestore/useLiveSteps";
 import { ScrapeGrid } from "@/components/dashboard/scrape-grid";
 import { IndicatorTiles } from "@/components/dashboard/indicator-tiles";
 import { LiveLog } from "@/components/dashboard/live-log";
+import { PlayScrapeButton } from "@/components/dashboard/play-scrape-button";
+import { SystemPauseBanner } from "@/components/dashboard/system-pause-banner";
 import { RowDetailDrawer } from "@/components/row-detail-drawer";
 import { Button } from "@/components/ui/button";
 
@@ -79,6 +81,7 @@ export default function DashboardPage() {
       </header>
 
       {combinedError && <FirestoreError message={combinedError} />}
+      <SystemPauseBanner />
 
       <div className="flex flex-1 gap-2 overflow-hidden">
         <section className="flex flex-1 flex-col">
@@ -91,6 +94,7 @@ export default function DashboardPage() {
               rows={rows}
               runningRowIds={runningRowIds}
               onSelect={(r) => setSelectedRow(r)}
+              headerActions={<PlayScrapeButton rows={rows} />}
             />
           )}
         </section>

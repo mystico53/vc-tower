@@ -86,10 +86,12 @@ export function ScrapeGrid({
   rows,
   runningRowIds,
   onSelect,
+  headerActions,
 }: {
   rows: Row[];
   runningRowIds: Set<string>;
   onSelect: (row: Row) => void;
+  headerActions?: React.ReactNode;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -186,9 +188,12 @@ export function ScrapeGrid({
 
   return (
     <div className="flex h-full flex-col gap-2">
-      <div className="flex items-center justify-between">
-        <div className="text-xs text-muted-foreground">
-          {rows.length.toLocaleString()} rows · {runningRowIds.size} running
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <div className="text-xs text-muted-foreground">
+            {rows.length.toLocaleString()} rows · {runningRowIds.size} running
+          </div>
+          {headerActions}
         </div>
         {legend}
       </div>

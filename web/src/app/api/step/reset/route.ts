@@ -57,12 +57,17 @@ export async function POST(req: Request) {
   // against that cleared state so the pills reflect a fresh research cycle.
   const cleared: Partial<Row> = {
     stages: [],
+    stages_openvc: [],
+    stages_raw: null,
     sectors_l1: [],
     sectors_l2: [],
+    sectors_raw: null,
     thesis: null,
+    notes: null,
     check_min_usd: null,
     check_max_usd: null,
     check_bands: [],
+    check_raw: null,
     hq_country: null,
     hq_address: null,
     countries_invest: [],
@@ -70,6 +75,8 @@ export async function POST(req: Request) {
     completeness_score: 0,
     partners: [],
     portfolio_companies: [],
+    x_voice_summary: null,
+    x_recent_posts: [],
     scrape_status: null,
     scrape_status_reason: null,
   };

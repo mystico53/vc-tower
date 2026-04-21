@@ -77,6 +77,14 @@ export async function POST(req: Request) {
       if (e.code === "budget_exhausted") {
         return NextResponse.json({ error: "budget exhausted", ...(e.detail as object) }, { status: 409 });
       }
+      if (e.code === "system_paused") {
+        // Distinguishable body so the client can halt the whole run, not just
+        // retry this row.
+        return NextResponse.json(
+          { error: "system paused", code: "system_paused", ...(e.detail as object) },
+          { status: 409 },
+        );
+      }
     }
     if (e instanceof BudgetExceededError) {
       return NextResponse.json({ error: e.message }, { status: 409 });

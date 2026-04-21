@@ -55,10 +55,20 @@ function summarizeError(msg: string | null | undefined): string | null {
   if (m.includes("err_tunnel_connection_failed")) return "proxy error";
   if (m.includes("err_name_not_resolved") || m.includes("getaddrinfo") || m.includes("dns"))
     return "DNS error";
+  if (m.includes("scrape_dns_resolution_error") || m.includes("dead_host")) return "host unreachable";
   if (m.includes("err_cert") || m.includes("certificate") || m.includes("ssl"))
     return "cert error";
   if (m.includes("err_connection_refused")) return "connection refused";
   if (m.includes("err_connection_timed_out") || m.includes("timeout")) return "timeout";
+  // Both upstreams failed on the same URL — origin is the real problem
+  // (unreachable, blocking bots, or broken) rather than our vendors. Shown
+  // before the generic 4xx/5xx matcher so "firecrawl 500 + jina 422" resolves
+  // to a user-facing cause, not to plumbing status codes.
+  if (/firecrawl\s+\d+.*jina/i.test(m) || /jina.*firecrawl\s+\d+/i.test(m)) return "site unreachable";
+  // Origin returned a real status code via firecrawl's proxy — report what
+  // the site itself actually did.
+  const originMatch = m.match(/origin\s+([45]\d\d)/);
+  if (originMatch) return originMatch[1] === "404" ? "404 not found" : `origin ${originMatch[1]}`;
   // First HTTP status code anywhere in the message wins. Chained errors
   // ("firecrawl 500 + jina 422") should report the upstream (500) root cause,
   // not the fallback's follow-on status.

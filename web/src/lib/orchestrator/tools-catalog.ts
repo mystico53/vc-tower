@@ -32,6 +32,26 @@ export const ORCHESTRATOR_TOOLS: ToolDef[] = [
   {
     type: "function",
     function: {
+      name: "web_search",
+      description:
+        "Search the web for a firm's real homepage when row.website is null or otherwise unusable. Returns a list of ranked URLs with title + description — the next step should call firecrawl_website on the best match. Use this BEFORE falling back to linkedin_company when row.website is null and row.firm_name is known. Do NOT call when row.website is already a usable http(s) URL.",
+      parameters: {
+        type: "object",
+        properties: {
+          reasoning: { type: "string" },
+          query: {
+            type: "string",
+            description:
+              "Short search query. Prefer `\"Firm Name\" venture capital` or `\"Firm Name\" VC site` — quoting the firm name anchors the search on the exact entity.",
+          },
+        },
+        required: ["reasoning", "query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "linkedin_profile",
       description:
         "Scrape a LinkedIn personal profile. Use only for investor_type angel, solo_gp, scout_fund, or contact when row.linkedin is a /in/ URL.",

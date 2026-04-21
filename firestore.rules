@@ -19,6 +19,14 @@ service cloud.firestore {
           allow write: if false;
         }
       }
+
+      // Global pause doc (projects/{pid}/system/state). Read-only from the
+      // client so the dashboard banner can subscribe live; writes go through
+      // Admin SDK via /api/system/unpause and the orchestrator trip path.
+      match /system/{docId} {
+        allow read: if request.auth != null;
+        allow write: if false;
+      }
     }
 
     // Required for collectionGroup('steps') queries (e.g. the dashboard

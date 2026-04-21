@@ -324,7 +324,8 @@ export async function POST(req: Request) {
       outcome = await runOneStep(db, projectId, rowId);
     } catch (e) {
       if (e instanceof PreCheckError) {
-        // Budget/step cap reached before we could run more.
+        // Budget / step cap / system paused — stop the loop rather than
+        // erroring the whole harness response.
         break;
       }
       if (e instanceof BudgetExceededError) {

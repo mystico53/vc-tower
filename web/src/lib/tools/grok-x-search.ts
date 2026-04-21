@@ -1,4 +1,5 @@
 import { env } from "@/lib/env";
+import { classifyUpstreamError } from "./classify-error";
 import type { ToolResult } from "./types";
 
 type GrokArgs = {
@@ -98,6 +99,7 @@ Respond with ONLY the JSON object. No prose, no markdown fences.`;
       cost_cents: 0,
       raw: null,
       error: `xai network error: ${(e as Error).message}`,
+      error_kind: "network",
     };
   }
 
@@ -115,6 +117,7 @@ Respond with ONLY the JSON object. No prose, no markdown fences.`;
       cost_cents: 0,
       raw: body,
       error: `xai ${res.status}: ${text.slice(0, 300)}`,
+      error_kind: classifyUpstreamError(res.status, text),
     };
   }
 
@@ -124,4 +127,73 @@ Respond with ONLY the JSON object. No prose, no markdown fences.`;
     cost_cents: 1,
     raw: body,
   };
+}
+
+export type ParsedGrokProfile = {
+  handle: string | null;
+  voice_summary: string | null;
+  recent_posts: Array<{ date: string; text: string }>;
+};
+
+// Pull the JSON payload out of a Grok Responses API body. Prefers the top-level
+// output_text convenience; falls back to walking output[].content[].text. The
+// model occasionally wraps JSON in ```json fences — strip those too. Used by
+// the per-partner X lookup endpoint, which writes the parsed fields directly
+// into row.partners without going through Qwen.
+export function parseGrokProfile(raw: unknown): ParsedGrokProfile | null {
+  if (!raw || typeof raw !== "object") return null;
+  const body = raw as { output_text?: unknown; output?: unknown };
+
+  let text: string | null = null;
+  if (typeof body.output_text === "string" && body.output_text.trim().length > 0) {
+    text = body.output_text;
+  } else if (Array.isArray(body.output)) {
+    const parts: string[] = [];
+    for (const item of body.output) {
+      if (!item || typeof item !== "object") continue;
+      const content = (item as { content?: unknown }).content;
+      if (!Array.isArray(content)) continue;
+      for (const c of content) {
+        if (!c || typeof c !== "object") continue;
+        const t = (c as { text?: unknown }).text;
+        if (typeof t === "string") parts.push(t);
+      }
+    }
+    if (parts.length > 0) text = parts.join("");
+  }
+  if (!text) return null;
+
+  const cleaned = text
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "")
+    .trim();
+
+  let obj: unknown;
+  try {
+    obj = JSON.parse(cleaned);
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== "object") return null;
+  const o = obj as Record<string, unknown>;
+
+  const handle =
+    typeof o.handle === "string" && o.handle.trim().length > 0
+      ? o.handle.trim().replace(/^@/, "")
+      : null;
+  const voice_summary =
+    typeof o.voice_summary === "string" && o.voice_summary.trim().length > 0
+      ? o.voice_summary.trim()
+      : null;
+  const recent_posts: ParsedGrokProfile["recent_posts"] = Array.isArray(o.recent_posts)
+    ? o.recent_posts.flatMap((p) => {
+        if (!p || typeof p !== "object") return [];
+        const date = (p as { date?: unknown }).date;
+        const t = (p as { text?: unknown }).text;
+        if (typeof date !== "string" || typeof t !== "string") return [];
+        return [{ date, text: t }];
+      })
+    : [];
+
+  return { handle, voice_summary, recent_posts };
 }
