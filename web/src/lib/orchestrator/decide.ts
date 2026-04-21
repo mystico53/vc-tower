@@ -25,6 +25,9 @@ export type OrchestratorInput = {
     extracted_count?: number;
     url?: string | null;
     discovered_links?: string[];
+    // Populated on failed steps from the Firestore doc — lets the decide
+    // prompt branch on "invented_url" / "dead_host" / "rate_limit" / etc.
+    error_kind?: string | null;
   }>;
   urlsScraped: string[];
   // Hostnames proven unreachable on a prior step (DNS failure or equivalent).
