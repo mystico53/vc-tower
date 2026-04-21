@@ -130,9 +130,14 @@ function sourceText(input: ExtractorInput): string {
 }
 
 function buildClient(): OpenAI {
+  // Extractor runs on xAI Grok via the OpenAI-compat endpoint. 30s timeout
+  // caps the Gemini-preview-style 500s hangs we saw in prod; maxRetries: 1
+  // keeps a single stalled request from turning into 3 (SDK default is 2).
   return new OpenAI({
-    apiKey: env.DASHSCOPE_API_KEY,
-    baseURL: env.DASHSCOPE_BASE_URL,
+    apiKey: env.XAI_API_KEY,
+    baseURL: env.XAI_BASE_URL,
+    timeout: 30_000,
+    maxRetries: 1,
   });
 }
 
@@ -186,7 +191,7 @@ async function callExtractor(
 ): Promise<string> {
   try {
     const res = await client.chat.completions.create({
-      model: env.DASHSCOPE_MODEL,
+      model: env.EXTRACT_MODEL,
       temperature: 0,
       response_format: { type: "json_object" },
       messages: [
@@ -420,6 +425,10 @@ export async function extract(input: ExtractorInput): Promise<ExtractedDelta> {
 
   const first = await tryOnce(null);
   if ("ok" in first) {
+    // Valid JSON that happened to be empty means the model saw the source and
+    // decided nothing was extractable. Re-asking will just produce the same
+    // answer (and cost another LLM call). Only the schema-error path below
+    // benefits from a retry with a correction hint.
     if (Object.keys(first.ok).length === 0) {
       console.warn("[extract] empty delta on first try. model_raw:", first.raw.slice(0, 800));
     }

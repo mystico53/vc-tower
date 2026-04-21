@@ -20,12 +20,20 @@ function optionalInt(name: string, fallback: number): number {
 }
 
 export const env = {
-  // DashScope / Qwen (orchestrator + extractor)
-  get DASHSCOPE_API_KEY() { return required("DASHSCOPE_API_KEY"); },
-  get DASHSCOPE_BASE_URL() {
-    return optional("DASHSCOPE_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1");
+  // Google Gemini (orchestrator + extractor) via OpenAI compatibility endpoint.
+  // Used through the `openai` SDK with baseURL pointed at Google's compat layer.
+  get GEMINI_API_KEY() { return required("GEMINI_API_KEY"); },
+  get GEMINI_BASE_URL() {
+    return optional("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/");
   },
-  get DASHSCOPE_MODEL() { return optional("DASHSCOPE_MODEL", "qwen-plus-2025-09-11"); },
+  get GEMINI_MODEL() { return optional("GEMINI_MODEL", "gemini-3-flash-preview"); },
+  // Split roles so decide and extract can be tuned independently.
+  // DECIDE_MODEL runs on Gemini (orchestrator reasoning). EXTRACT_MODEL runs
+  // on xAI Grok (see XAI_* block below) — chosen for 5x cheaper output tokens
+  // and faster TTFT than Gemini Flash, which matters because the extractor is
+  // the hot path on every scrape step.
+  get DECIDE_MODEL() { return optional("DECIDE_MODEL", this.GEMINI_MODEL); },
+  get EXTRACT_MODEL() { return optional("EXTRACT_MODEL", "grok-4-1-fast-non-reasoning"); },
 
   // Firecrawl
   get FIRECRAWL_API_KEY() { return required("FIRECRAWL_API_KEY"); },
@@ -41,6 +49,7 @@ export const env = {
 
   // xAI Grok
   get XAI_API_KEY() { return required("XAI_API_KEY"); },
+  get XAI_BASE_URL() { return optional("XAI_BASE_URL", "https://api.x.ai/v1"); },
   get XAI_MODEL() { return optional("XAI_MODEL", "grok-4-1-fast"); },
   // Kill switch for the grok_x_lookup tool. Each call costs ~1-5¢ in x_search
   // credits; set GROK_X_LOOKUP_ENABLED=false to drop it from the orchestrator
@@ -52,6 +61,11 @@ export const env = {
   // Budget caps (per row)
   get STEP_MAX_PER_ROW() { return optionalInt("STEP_MAX_PER_ROW", 5); },
   get STEP_BUDGET_CENTS_PER_ROW() { return optionalInt("STEP_BUDGET_CENTS_PER_ROW", 10); },
+  // Dead-letter threshold. Rows whose `zero_progress_streak` reaches this
+  // count are classified as dead_letter and dropped from the play-scrape
+  // candidate pool. Reset by any successful field merge. Kept low by default
+  // so truly broken profiles stop burning credits after a single retry cycle.
+  get DEAD_LETTER_STREAK() { return optionalInt("DEAD_LETTER_STREAK", 3); },
 
   // Dev-only harness auth. When set + NODE_ENV !== production, /api/step/harness
   // accepts x-dev-key headers matching this value. Leave blank to disable the
